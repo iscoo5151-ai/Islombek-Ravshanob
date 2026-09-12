@@ -341,6 +341,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Shaxsiy xotiraga va guruh umumiy oqimiga bir vaqtda yozamiz
         memory.record_personal(chat.id, user.id, "user", clean_text)
         memory.record_group_snapshot(chat.id, name, clean_text)
+        memory.update_group_activity(chat.id)
 
         if not is_called:
             now = time.time()
@@ -399,6 +400,7 @@ async def handle_sticker(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         memory.record_personal(chat.id, user.id, "user", sticker_desc)
         memory.record_group_snapshot(chat.id, name, sticker_desc)
+        memory.update_group_activity(chat.id)
 
         if not is_called:
             now = time.time()
@@ -519,6 +521,249 @@ def _build_digest_text(chat_id: int, hours_back: int = 24) -> str | None:
     except Exception as e:
         logger.error(f"Xulosa yaratishda xato: {e}")
         return None
+
+
+# ============================================================
+# ESLATMA (REMINDER) TIZIMI
+# ============================================================
+
+def _parse_relative_time(text: str) -> int | None:
+    """Matndan 'N daqiqadan keyin', 'N soatdan keyin', 'N kundan keyin' kabi
+    ifodalarni topib, necha soniyadan keyin ekanini qaytaradi. Topilmasa None."""
+    text = text.lower()
+
+    patterns = [
+        (r"(\d+)\s*(daqiqa|minut)", 60),
+        (r"(\d+)\s*(soat)", 3600),
+        (r"(\d+)\s*(kun)", 86400),
+    ]
+    for pattern, multiplier in patterns:
+        match = re.search(pattern, text)
+        if match:
+            return int(match.group(1)) * multiplier
+
+    return None
+
+
+def _extract_reminder_message(text: str) -> str:
+    """Vaqt ifodasi va 'eslat' kabi so'zlarni olib tashlab, faqat eslatma matnini qoldiradi."""
+    cleaned = re.sub(r"\d+\s*(daqiqa|minut|soat|kun)dan?\s*(keyin|so'ng|so'ngra)?", "", text, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\b(eslat|eslatib qo'y|eslatma qil|meni?ga?)\b", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" ,.:-")
+    return cleaned or "eslatma vaqti keldi"
+
+
+async def _reminder_callback(context: ContextTypes.DEFAULT_TYPE):
+    """Belgilangan vaqt kelganda ishga tushib, foydalanuvchiga eslatma yuboradi."""
+    job = context.job
+    chat_id = job.data["chat_id"]
+    user_id = job.data["user_id"]
+    reminder_text = job.data["text"]
+
+    is_owner = memory.is_owner(memory.get_username(chat_id, user_id))
+    await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+
+    reply = generate_reply(
+        chat_id, user_id, is_owner,
+        include_group_context=False,
+        extra_instruction=(
+            f"[TIZIM ESLATMASI] Foydalanuvchi sendan avval \"{reminder_text}\" haqida eslatib "
+            "qo'yishingni so'ragan edi, va hozir aynan shu payt keldi. Unga hazil-mutoyiba bilan, "
+            "qiziqarli tarzda eslatib qo'y — quruq 'eslatma' emas, o'zingcha qiziqarli ohangda ayt."
+        ),
+    )
+    try:
+        await context.bot.send_message(chat_id=chat_id, text=f"⏰ {reply}")
+    except Exception as e:
+        logger.warning(f"Eslatma yuborib bo'lmadi: {e}")
+
+
+async def remind_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/eslat <vaqt> <matn> — masalan: /eslat 30 daqiqa suv ich
+    Yoki tabiiy tilda: botga reply/tag qilib 'menga 2 soatdan keyin ... eslat' deb yozish ham ishlaydi."""
+    chat = update.effective_chat
+    user = update.effective_user
+    full_text = " ".join(context.args) if context.args else ""
+
+    if not full_text:
+        await update.message.reply_text(
+            "Nimani va qachon eslataman? Masalan:\n/eslat 30 daqiqa suv ich\n/eslat 2 soat mashqqa bor"
+        )
+        return
+
+    seconds = _parse_relative_time(full_text)
+    if seconds is None or seconds <= 0:
+        await update.message.reply_text(
+            "Vaqtni tushunmadim 😅 Masalan shunday yoz: /eslat 30 daqiqa suv ich"
+        )
+        return
+
+    if seconds > 7 * 86400:
+        await update.message.reply_text("Juda uzoq muddat, 7 kundan oshmasin 😄")
+        return
+
+    reminder_text = _extract_reminder_message(full_text)
+
+    if context.job_queue:
+        context.job_queue.run_once(
+            _reminder_callback,
+            when=seconds,
+            data={"chat_id": chat.id, "user_id": user.id, "text": reminder_text},
+        )
+        human_time = (
+            f"{seconds // 86400} kundan" if seconds >= 86400 else
+            f"{seconds // 3600} soatdan" if seconds >= 3600 else
+            f"{seconds // 60} daqiqadan"
+        )
+        await update.message.reply_text(f"Xo'p! {human_time} keyin \"{reminder_text}\" deb eslataman ⏰")
+    else:
+        await update.message.reply_text("Eslatma tizimi hozircha ishlamayapti, keyinroq urinib ko'ring 😅")
+
+
+
+async def warn_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/warn — reply qilib yozilganda o'sha odamga ogohlantirish beradi (admin bo'lganda ishlaydi)."""
+    message = update.message
+    chat = update.effective_chat
+    user = update.effective_user
+
+    is_owner = _touch_and_check_owner(chat.id, user)
+    if not is_owner:
+        await message.reply_text("Bu buyruq faqat mening egam uchun 😏")
+        return
+
+    if not message.reply_to_message:
+        await message.reply_text("Kimni ogohlantiray? Xabariga reply qilib /warn deb yoz.")
+        return
+
+    target = message.reply_to_message.from_user
+    memory.touch_user(chat.id, target.id, target.username, target.first_name)
+    warn_count = memory.add_warn(chat.id, target.id)
+    target_name = target.first_name or target.username or "Kimdir"
+
+    reply = generate_reply(
+        chat.id, user.id, True,
+        include_group_context=False,
+        extra_instruction=(
+            f"[TIZIM ESLATMASI] Ega sendan \"{target_name}\" ismli odamga rasmiy ogohlantirish "
+            f"berish buyrug'ini berdi. Bu uning {warn_count}-ogohlantirishidir. "
+            "Rasmiy, biroz qattiq, lekin hazil bilan aralashtirib ogohlantirish xabarini yoz. "
+            f"Agar warn {warn_count} >= 3 bo'lsa — yanada jiddiyroq va 'keyingi safar chora "
+            "ko'raman' deb ogohlantir."
+        ),
+    )
+    await message.reply_text(f"⚠️ {target_name} → {warn_count} ta ogohlantirish\n\n{reply}")
+
+
+async def unwarn_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/unwarn — reply qilib yozilganda o'sha odamning ogohlantirish sonini tozalaydi."""
+    message = update.message
+    chat = update.effective_chat
+    user = update.effective_user
+
+    is_owner = _touch_and_check_owner(chat.id, user)
+    if not is_owner:
+        await message.reply_text("Bu buyruq faqat mening egam uchun 😏")
+        return
+
+    if not message.reply_to_message:
+        await message.reply_text("Kimning warnini tozalayman? Xabariga reply qilib /unwarn deb yoz.")
+        return
+
+    target = message.reply_to_message.from_user
+    memory.reset_warns(chat.id, target.id)
+    target_name = target.first_name or target.username or "Kimdir"
+    await message.reply_text(f"✅ {target_name} ning barcha ogohlantirishlari tozalandi.")
+
+
+# ============================================================
+# BOT O'ZI GURUHDA SUHBAT BOSHLAYDI — faol bo'lish tizimi
+# ============================================================
+
+# Vaqtga qarab faollik darajasi — tunda kam, kunduz ko'p
+def _get_activity_chance() -> float:
+    hour = datetime.datetime.now().hour
+    if 0 <= hour < 7:
+        return 0.0   # tunda uxlaydi, yozmaydi
+    elif 7 <= hour < 10:
+        return 0.4   # ertalab biroz yozadi
+    elif 10 <= hour < 22:
+        return 1.0   # kunduz to'liq faol
+    else:
+        return 0.6   # kechqurun o'rtacha
+
+
+# Botning guruhga o'zi yoza oladigan xabar turlari
+PROACTIVE_PROMPTS = [
+    "Guruhda uzoqdan hech kim yozmadi. Suhbatni jonlantirishga harakat qil — "
+    "qiziqarli savol ber, hazil qil yoki g'ayrioddiy bir narsa ayt. "
+    "Kimnidir @username bilan chaqirish ham mumkin — guruhda bo'lgan odamlardan "
+    "birini tegga olib murojaat qil.",
+
+    "Guruh jim qoldi. Hammani faollashtirish uchun — oxirgi mavzuni davom ettir, "
+    "yoki yangi qiziqarli savol ber. Agar kimni chaqirish kerak bo'lsa, "
+    "@username bilan tegga ol.",
+
+    "Guruh uzoqdan gapirishni to'xtatgan. Suhbat boshlash uchun biror "
+    "kutilmagan, kulgili yoki hayratlanarli gap ayt — odamlar javob bersinlar.",
+
+    "Hech kim yozmayapti. Bu senga navbat — eng kulgili yoki eng qiziqarli "
+    "savolingni ber. Guruhni uygot.",
+]
+
+
+async def _proactive_chat_job(context: ContextTypes.DEFAULT_TYPE):
+    """Har 10 daqiqada tekshiradi — agar guruhda 1 soatdan ko'p jim bo'lsa, bot o'zi yozadi."""
+    now = time.time()
+    INACTIVITY_THRESHOLD = 3600  # 1 soat (sekundda)
+
+    for chat_id in memory.get_all_active_chats():
+        last_activity = memory.get_group_last_activity(chat_id)
+
+        # 1 soatdan kam jim bo'lsa, yoki faollik darajasi 0 bo'lsa — o'tkazib yuboramiz
+        if now - last_activity < INACTIVITY_THRESHOLD:
+            continue
+
+        activity_chance = _get_activity_chance()
+        if random.random() > activity_chance:
+            continue
+
+        # Guruhda kim bor — tegga olish uchun foydalanuvchilar ro'yxati
+        known_users = memory.list_known_users(chat_id)
+        mention_hints = ""
+        if known_users:
+            sample = random.sample(known_users, min(3, len(known_users)))
+            names = [f"@{u['username']}" for u in sample if u.get("username")]
+            if names:
+                mention_hints = f"Guruhda shu odamlar bor: {', '.join(names)}. Kerak bo'lsa bittasini tegga ol."
+
+        prompt = random.choice(PROACTIVE_PROMPTS)
+        if mention_hints:
+            prompt += f"\n{mention_hints}"
+
+        # Vaqtga qarab maxsus qo'shimcha
+        hour = datetime.datetime.now().hour
+        if 7 <= hour <= 9:
+            prompt += " Ertalab salomlashish ruhi bilan boshla."
+        elif 12 <= hour <= 13:
+            prompt += " Tushlik vaqtida odamlar biroz bo'sharoq bo'ladi — shunga mos yoz."
+        elif 20 <= hour <= 22:
+            prompt += " Kechqurun odamlar dam olishda — shunga mos kayfiyatda yoz."
+
+        # Biron foydalanuvchi nomidan emas, guruh umumiy xotirasidan yozamiz
+        # user_id = 0 (haqiqiy foydalanuvchi emas, bot o'zi)
+        try:
+            reply = generate_reply(
+                chat_id, 0, False,
+                include_group_context=True,
+                extra_instruction=f"[TIZIM ESLATMASI] {prompt}",
+            )
+            await context.bot.send_message(chat_id=chat_id, text=reply)
+            memory.update_group_activity(chat_id)  # yozgandan keyin vaqtni yangilaymiz
+            logger.info(f"[Proaktiv xabar] chat={chat_id} ga yuborildi")
+        except Exception as e:
+            logger.warning(f"[Proaktiv xabar] chat={chat_id} ga yuborib bo'lmadi: {e}")
+
 
 
 async def digest_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -742,6 +987,8 @@ def main():
     app.add_handler(CommandHandler("gap_kim", leaderboard_command))
     app.add_handler(CommandHandler("xulosa", digest_command))
     app.add_handler(CommandHandler("adminlar", admins_command))
+    app.add_handler(CommandHandler("warn", warn_command))
+    app.add_handler(CommandHandler("unwarn", unwarn_command))
     app.add_handler(CommandHandler("buyruq", add_directive_command))
     app.add_handler(CommandHandler("buyruqlar", list_directives_command))
     app.add_handler(CommandHandler("buyruq_ochir", clear_directives_command))
@@ -751,13 +998,21 @@ def main():
 
     # Har kuni soat DIGEST_HOUR:00 da avtomatik xulosa yuborishni tekshiradi
     if app.job_queue:
+        # Kunlik xulosa — har kuni soat 21:00 da
         app.job_queue.run_daily(
             _auto_digest_job,
             time=datetime.time(hour=DIGEST_HOUR, minute=0),
         )
+        # Proaktiv suhbat — har 10 daqiqada tekshiradi, agar 1 soat jim bo'lsa yozadi
+        app.job_queue.run_repeating(
+            _proactive_chat_job,
+            interval=600,  # 10 daqiqa
+            first=60,      # ishga tushgandan 1 daqiqa keyin birinchi tekshiruv
+        )
+        logger.info("Proaktiv suhbat va kunlik xulosa jadvallari yoqildi ✅")
     else:
         logger.warning(
-            "JobQueue mavjud emas — avtomatik kunlik xulosa ishlamaydi. "
+            "JobQueue mavjud emas — avtomatik xabar va xulosa ishlamaydi. "
             "O'rnatish uchun: pip install 'python-telegram-bot[job-queue]'"
         )
 
