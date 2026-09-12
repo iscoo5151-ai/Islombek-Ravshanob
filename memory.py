@@ -25,10 +25,41 @@ class Memory:
         self._users = {}
         # chat_id -> [ {"name": str, "text": str, "ts": float} ]  — guruh umumiy oqimi
         self._group_snapshot = {}
+        # chat_id -> so'nggi xabar vaqti (unix time)
+        self._group_last_activity = {}
+        # (chat_id, user_id) -> warn soni
+        self._user_warns = {}
+
+    def update_group_activity(self, chat_id: int):
+        self._group_last_activity[chat_id] = time.time()
+
+    def get_group_last_activity(self, chat_id: int) -> float:
+        return self._group_last_activity.get(chat_id, 0.0)
+
+    def get_all_active_chats(self) -> list[int]:
+        """Hech bo'lmasa bitta xabar bo'lgan barcha guruh chat_id larini qaytaradi."""
+        return list(self._group_last_activity.keys())
+
+    def add_warn(self, chat_id: int, user_id: int) -> int:
+        key = (chat_id, user_id)
+        self._user_warns[key] = self._user_warns.get(key, 0) + 1
+        return self._user_warns[key]
+
+    def get_warns(self, chat_id: int, user_id: int) -> int:
+        return self._user_warns.get((chat_id, user_id), 0)
+
+    def reset_warns(self, chat_id: int, user_id: int):
+        self._user_warns.pop((chat_id, user_id), None)
         # Egangiz bergan doimiy xatti-harakat buyruqlari (masalan "X ga yumshoqroq gapir")
         self._owner_directives = []
         # username -> [buyruqlar ro'yxati] — ma'lum bir odamga nisbatan berilgan ko'rsatmalar
         self._user_directives = {}
+        # chat_id -> oxirgi HAQIQIY ODAM yozgan vaqt (bot o'z-o'zidan yozgani hisobga olinmaydi)
+        self._last_human_activity = {}
+        # chat_id -> bot oxirgi marta "jonlantirish" xabari yuborgan vaqt
+        self._last_revival = {}
+        # (chat_id, user_id) -> ogohlantirishlar soni (moderatsiya uchun)
+        self._warnings = {}
 
     # ---------- Foydalanuvchi ma'lumotlari ----------
 
@@ -180,3 +211,36 @@ class Memory:
 
     def clear_user_directives(self, username: str):
         self._user_directives.pop(username.lstrip("@").lower(), None)
+
+    # ---------- Guruh faolligi (jim qolgan guruhni "jonlantirish" uchun) ----------
+
+    def touch_human_activity(self, chat_id: int):
+        """Guruhda HAQIQIY odam yozganda chaqiriladi — botning o'z xabarlari hisobga olinmaydi."""
+        self._last_human_activity[chat_id] = time.time()
+
+    def get_last_human_activity(self, chat_id: int) -> float:
+        return self._last_human_activity.get(chat_id, time.time())
+
+    def known_chat_ids(self):
+        """Bot xabar ko'rgan barcha guruh chat_id'lari (jonlantirish tekshiruvi uchun)."""
+        return list(self._last_human_activity.keys())
+
+    def mark_revival(self, chat_id: int):
+        self._last_revival[chat_id] = time.time()
+
+    def get_last_revival(self, chat_id: int) -> float:
+        return self._last_revival.get(chat_id, 0)
+
+    # ---------- Moderatsiya (ogohlantirishlar) ----------
+
+    def add_warning(self, chat_id: int, user_id: int) -> int:
+        """Ogohlantirish sonini oshiradi va yangi sonini qaytaradi."""
+        key = self._key(chat_id, user_id)
+        self._warnings[key] = self._warnings.get(key, 0) + 1
+        return self._warnings[key]
+
+    def get_warning_count(self, chat_id: int, user_id: int) -> int:
+        return self._warnings.get(self._key(chat_id, user_id), 0)
+
+    def reset_warnings(self, chat_id: int, user_id: int):
+        self._warnings.pop(self._key(chat_id, user_id), None)
